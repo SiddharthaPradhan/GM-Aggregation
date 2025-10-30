@@ -19,6 +19,45 @@ CONTENT_DICT = {
 # Filename for the processed study metadata text file
 STUDY_METADATA_TXT = "study_info.txt"
 TXT_SEPARATOR = "-" * 60 + "\n"
+# cols of interest for aggregation
+EVENT_COLS_TO_KEEP = [
+    "studentRef",
+    "taskNumber",
+    "attemptNumber",
+    "eventType",
+    "timestamp",
+    "mistake",
+    "stars",
+    "attemptHlc",
+    "visitId",
+]
+
+
+# Event types in the event log
+class EventLogTypes:
+    MATH_STEP = "mathStep"
+    MATH_MISTAKE = "mathMistake"
+    SOLVED_TASK = "solvedTask"
+    VISIT_TASK = "visitTask"
+    RESET_TASK = "resetTask"
+    SHOW_HINT = "showHint"
+    VISIT_GAME_SCREEN = "visitGameScreen"
+    HIDE_HINT = "hideHint"
+
+
+class EventMistakeTypes:
+    KEYPAD = "keypad"
+    TAP = "tap"
+    DRAG = "drag"
+
+
+# User interaction events: math actions, mistake events or hint events
+ACTION_EVENTS = [
+    EventLogTypes.MATH_STEP,
+    EventLogTypes.MATH_MISTAKE,
+    EventLogTypes.HIDE_HINT,
+    EventLogTypes.SHOW_HINT,
+]
 
 
 def write_to_study_meta_text(

@@ -5,7 +5,7 @@ Handles CMD line input
 import argparse
 import os
 import logging
-from aggregate import aggregate_event_log_to_attempt_level
+from aggregate import aggregate_and_save
 from preprocess import (
     preprocess_and_save_metadata,
     preprocess_and_save_event_log,
@@ -129,10 +129,6 @@ def main():
     # Validate arguments and prepare paths
     args = validate_and_process_args(args, logger)
 
-    # save initial study metadata
-    # other study-level info will be added during aggregation
-    save_study_metadata(args["input_file"], args["study_output_dir"])
-
     # preprocess and save metadata
     preprocess_and_save_metadata(
         args["input_file"], args["study_output_dir"], args["output_type"]
@@ -141,15 +137,12 @@ def main():
     event_log_df = preprocess_and_save_event_log(
         args["input_file"], args["study_output_dir"], args["output_type"]
     )
-    # aggregate event log to attempt level
-    # aggregated_attempt_df = aggregate_event_log_to_attempt_level(event_log_df)
-    # merge with GMA preprocessed attempt data and save
-
-    # aggregate to student-problem level
-
-    # aggregate to student-level
-
-    # aggregate to problem-level
+    aggregate_and_save(
+        event_log_df,
+        args["study_output_dir"],
+        args["output_type"],
+        n_jobs=args["njobs"],
+    )
 
     # exit
     logger.info(f"All processed files saved to {args['study_output_dir']}")

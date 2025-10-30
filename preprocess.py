@@ -110,6 +110,9 @@ def preprocess_and_save_metadata(
         output_dir (str): Directory to save the preprocessed metadata
         output_type (OUTPUT_TYPE): Format to save the preprocessed metadata
     """
+    # save initial study metadata
+    # other study-level info will be added during aggregation
+    save_study_metadata(input, output_dir)
     # Roster Metadata
     logger.info("Starting Metadata Preprocessing..")
     try:
