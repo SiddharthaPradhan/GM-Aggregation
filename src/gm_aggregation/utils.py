@@ -2,7 +2,7 @@ import os
 import pandas as pd
 import zipfile
 import sqlite3
-from typing import Literal, get_args
+from typing import Literal, get_args, IO
 import json
 from io import TextIOBase
 
@@ -19,18 +19,6 @@ CONTENT_DICT = {
 # Filename for the processed study metadata text file
 STUDY_METADATA_TXT = "study_info.txt"
 TXT_SEPARATOR = "-" * 60 + "\n"
-# cols of interest for aggregation
-EVENT_COLS_TO_KEEP = [
-    "studentRef",
-    "taskNumber",
-    "attemptNumber",
-    "eventType",
-    "timestamp",
-    "mistake",
-    "stars",
-    "attemptHlc",
-    "visitId",
-]
 
 
 # Event types in the event log
@@ -43,6 +31,8 @@ class EventLogTypes:
     SHOW_HINT = "showHint"
     VISIT_GAME_SCREEN = "visitGameScreen"
     HIDE_HINT = "hideHint"
+    UNDO_STEP = "undo"
+    REDO_STEP = "redo"
 
 
 class EventMistakeTypes:
@@ -58,6 +48,12 @@ ACTION_EVENTS = [
     EventLogTypes.HIDE_HINT,
     EventLogTypes.SHOW_HINT,
 ]
+
+
+class ResetReasons:
+    RESET_BUTTON = "resetButton"
+    RETRY_BUTTON = "retryButton"
+    AUTO = "autoReset"
 
 
 def write_to_study_meta_text(
@@ -82,7 +78,7 @@ def check_existence(file_path):
 
 
 def load_zip(zip_path):
-    """Validate and load zip object. Note that this not extract or load files to memory."""
+    """Validate and load zip object. Note that this does not extract or load files to memory."""
     check_existence(zip_path)
     if not zipfile.is_zipfile(zip_path):
         raise ValueError(f"{zip_path} is not a valid zip file.")
@@ -96,7 +92,10 @@ def load_zip(zip_path):
     return zip
 
 
-def load_df_from_file(file: TextIOBase | zipfile.ZipExtFile, lines: bool = False):
+def load_df_from_file(
+    file: TextIOBase | IO[bytes] | zipfile.ZipExtFile,
+    lines: bool = False,
+):
     """Load dataframe from file
 
     Args:
@@ -106,7 +105,7 @@ def load_df_from_file(file: TextIOBase | zipfile.ZipExtFile, lines: bool = False
     Returns:
         pd.DataFrame: Loaded DataFrame.
     """
-    df = pd.read_json(file, lines=lines)
+    df = pd.read_json(file, lines=lines, dtype_backend="pyarrow")
     return df
 
 
@@ -136,11 +135,13 @@ def save_df(
             df.to_sql(df_name, conn, if_exists="replace", index=False)
 
 
-def get_study_id(study_meta_file: str | zipfile.ZipExtFile) -> str:
+def get_study_id(
+    study_meta_file: str | TextIOBase | IO[bytes] | zipfile.ZipExtFile,
+) -> str:
     """Returns the study ID from the study metadata file in the input location or zip.
 
     Args:
-         study_meta_file (str | zipfile.ZipExtFile): Study metadata file path or ZipExtFile
+            study_meta_file (str | TextIOBase | IO[bytes] | zipfile.ZipExtFile): Study metadata file path or readonly file object
     )
     """
     study_metadata = json.load(study_meta_file)
@@ -149,7 +150,7 @@ def get_study_id(study_meta_file: str | zipfile.ZipExtFile) -> str:
 
 def get_file(
     input: str | zipfile.ZipFile, file_key: FILE_KEY_TYPE
-) -> TextIOBase | zipfile.ZipExtFile:
+) -> TextIOBase | IO[bytes] | zipfile.ZipExtFile:
     """Returns absolute file path or reader object for the `file_key` file from the input location or zip.
 
     Args:
@@ -157,7 +158,7 @@ def get_file(
         file_key (str): Key for the desired file in the content dictionary
 
     Returns:
-        TextIOBase | zipfile.ZipExtFile: Readonly file object
+        TextIOBase | IO[bytes] | zipfile.ZipExtFile: Readonly file object
     """
     if isinstance(input, zipfile.ZipFile):
         return input.open(CONTENT_DICT[file_key])  # Readonly file object

@@ -44,7 +44,7 @@ pip install -r requirements.txt
 
 ```bash
 # Test the installation
-python main.py --help
+uv run python -m gm_aggregation --help
 ```
 
 ## Usage
@@ -53,10 +53,13 @@ python main.py --help
 
 ```bash
 # If using uv:
-uv run main.py --input /path/to/data --output-type csv
+uv run python -m gm_aggregation --input /path/to/data --output-type csv
 
 # If using venv:
-python main.py --input /path/to/data --output-type csv
+python -m gm_aggregation --input /path/to/data --output-type csv
+
+# If installed as a package, use the console script:
+gm-aggregation --input /path/to/data --output-type csv
 ```
 
 ### Command Line Arguments
@@ -72,13 +75,13 @@ python main.py --input /path/to/data --output-type csv
 
 ```bash
 # Process a zip file and save as CSV
-python main.py -i data/study-data.zip -t csv -o ./results/
+python -m gm_aggregation -i data/study-data.zip -t csv -o ./results/
 
 # Process a directory with SQLite output and parallel processing
-python main.py -i /path/to/data/ -t sqlite -j 4 -v
+python -m gm_aggregation -i /path/to/data/ -t sqlite -j 4 -v
 
 # Process with both CSV and SQLite output, overwrite existing files
-python main.py -i data.zip -t both -w
+python -m gm_aggregation -i data.zip -t both -w
 ```
 
 ## Input Data Structure
@@ -112,10 +115,10 @@ output/
 
 ## File Descriptions
 
--   `main.py`: Command-line interface and orchestration
--   `preprocess.py`: Data cleaning and preprocessing functions
--   `aggregate.py`: Multi-level aggregation logic
--   `utils.py`: Utility functions for file I/O and data handling
+-   `src/gm_aggregation/cli.py`: Command-line interface and orchestration
+-   `src/gm_aggregation/preprocess.py`: Data cleaning and preprocessing functions
+-   `src/gm_aggregation/aggregate.py`: Multi-level aggregation logic
+-   `src/gm_aggregation/utils.py`: Utility functions for file I/O and data handling
 
 ## Development
 
@@ -123,10 +126,16 @@ output/
 
 ```
 GM-Aggregation/
-├── main.py              # CLI entry point
-├── preprocess.py        # Data preprocessing
-├── aggregate.py         # Aggregation logic
-├── utils.py            # Utility functions
+├── src/
+│   └── gm_aggregation/
+│       ├── __init__.py
+│       ├── __main__.py
+│       ├── cli.py
+│       ├── preprocess.py
+│       ├── aggregate.py
+│       ├── generate_graph.py
+│       ├── generate_classifications.py
+│       └── utils.py
 ├── requirements.txt    # Dependencies
 ├── pyproject.toml     # Project configuration
 └── README.md          # Documentation
