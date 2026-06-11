@@ -24,6 +24,7 @@ def run(
     input_path: str | os.PathLike,
     output_dir: str | os.PathLike = "./output",
     output_type: OUTPUT_TYPE = "csv",
+    convert_latex: bool = False,
     n_jobs: int = -1,
     overwrite: bool = False,
     verbose: bool = False,
@@ -89,8 +90,11 @@ def run(
         )
 
     task_meta_df = preprocess_and_save_metadata(
-        input_file, str(study_output_dir), output_type
+        input_file, str(study_output_dir), output_type, convert_latex
     )
+    if task_meta_df is None:
+        raise RuntimeError("Task metadata preprocessing returned no data")
+
     if progress_callback is not None:
         progress_callback(
             {
@@ -103,6 +107,7 @@ def run(
         input_file,
         str(study_output_dir),
         output_type,
+        convert_latex=convert_latex,
         n_jobs=n_jobs,
         progress_callback=progress_callback,
     )

@@ -17,7 +17,7 @@ CLASS_BEST = "optimal"
 CLASS_DEAD_END = "dead_end"
 CLASS_SUB_OPTIMAL = "sub_optimal"
 CLASS_INCOMPLETE = "incomplete"
-
+MISSING_NODE = "missing_node"
 CLASS_TYPE_MAPPING = {
     "studentSessionId": "category",
     "attemptHlc": "category",
@@ -45,11 +45,16 @@ def get_attempt_class(
     ):  # ignore if goal or start state missing (can happen for incomplete attempts)
         pass
     # if reached goal state and has the optimal length
+    if MISSING_NODE in attempt_set:
+        # if there are missing steps in the logs, we cannot classify the attempt,
+        # return NA for both classifications and a flag for missing steps
+        return pd.NA, pd.NA, True
+
     if attempt[-1] == goal_state:
         if attempt_len == best_path_len:
-            return CLASS_BEST, CLASS_BEST
+            return CLASS_BEST, CLASS_BEST, False
         else:  # if the last step is goal state and the length is > optimal length
-            return CLASS_SUB_OPTIMAL, CLASS_SUB_OPTIMAL
+            return CLASS_SUB_OPTIMAL, CLASS_SUB_OPTIMAL, False
     else:  # incomplete (either deadend or true incomplete)
         # global deadend classification
         if len(attempt_set.intersection(deadend_nodes)) > 0:
@@ -61,7 +66,7 @@ def get_attempt_class(
             attempt_class_individual = CLASS_DEAD_END
         else:
             attempt_class_individual = CLASS_INCOMPLETE
-        return attempt_class_global, attempt_class_individual
+        return attempt_class_global, attempt_class_individual, False
 
 
 def get_student_dead_end_set(student_G, start_state, goal_state):
@@ -114,12 +119,13 @@ def process_problem_classification(
         student_pathways = student_pathway_data["paths"]  # list of attempts
         global_class_list = []
         student_class_list = []
+        has_missing_steps_list = []
         # dead_end nodes: global and individual
         student_dead_end_set = get_student_dead_end_set(
             problem_stu_2_G_map[stu_id], start_state, goal_state
         )
         for student_attempt in student_pathways:
-            global_class, individual_class = get_attempt_class(
+            global_class, individual_class, has_missing_steps = get_attempt_class(
                 student_attempt,
                 start_state,
                 goal_state,
@@ -131,12 +137,15 @@ def process_problem_classification(
             global_class_list.append(global_class)
             # student/individual binned classification
             student_class_list.append(individual_class)
+            has_missing_steps_list.append(has_missing_steps)
+
         student_class_dict = {
             "studentSessionId": [stu_id] * len(student_pathways),
             "attemptHlc": student_pathway_data["attemptHlc"],
             "visitId": student_pathway_data["visitId"],
             "MFL_global_class": global_class_list,
             "MFL_individual_class": student_class_list,
+            "missing_steps_in_logs": has_missing_steps_list,
         }
         df = pd.DataFrame.from_dict(student_class_dict).astype(CLASS_TYPE_MAPPING)
 

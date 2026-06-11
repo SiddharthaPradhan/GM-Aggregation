@@ -327,6 +327,7 @@ def _aggregate_to_problem_level(student_problem_df: pd.DataFrame) -> pd.DataFram
         student_problem_df.groupby("taskNumber", observed=True, sort=False)
         .agg(
             total_students=("studentSessionId", "nunique"),
+            total_completed=("problem_completed", "sum"),
             avg_time_spent=("total_time_spent", "mean"),
             avg_attempts=("num_attempts", "mean"),
             avg_replays=("num_replays", "mean"),
@@ -414,6 +415,65 @@ def _set_student_problem_dtypes(student_problem_df: pd.DataFrame) -> pd.DataFram
     return student_problem_df.astype(STUDENT_PROBLEM_TYPE_MAPPING)
 
 
+# after discussion with David (on June 10, 2026)
+# Sid realized that refreshing pages store the current
+# state of the attempt (i.e. continues where the student left off) but with a new visitId
+# There is also the case where simultaneous tabs are open, where,
+#   attemptHlc point to the same attempt but different visitIds.
+# In other words,
+#       2+ tabs => same attemptHlc but different visitIds and different problem-states.
+#       1 tab, but student refreshes, or comes back to it later =>
+#           same attemptHlc, different visitIds but same problem-state (i.e. continuation).
+
+
+def _collapse_visit_ids_if_no_backtracking(visit_ids: pd.Series) -> pd.Series:
+    """Collapse visit ids to the first one if the sequence never returns to an earlier id.
+
+    Examples:
+        a,a,a,b,b -> a,a,a,a,a
+        a,a,b,a   -> unchanged
+    """
+    if visit_ids.empty:
+        return visit_ids
+
+    first_visit_id = visit_ids.iloc[0]
+    if pd.isna(first_visit_id):
+        return visit_ids
+
+    seen_visit_ids = {first_visit_id}
+    previous_visit_id = first_visit_id
+    has_changed = False
+
+    for current_visit_id in visit_ids.iloc[1:]:
+        if current_visit_id == previous_visit_id:
+            continue
+        has_changed = True
+        if current_visit_id in seen_visit_ids:
+            # Back-and-forth detected, keep original sequence.
+            return visit_ids
+        seen_visit_ids.add(current_visit_id)
+        previous_visit_id = current_visit_id
+
+    if not has_changed:
+        return visit_ids
+
+    collapsed_visit_ids = visit_ids.copy()
+    collapsed_visit_ids.loc[:] = first_visit_id
+    return collapsed_visit_ids
+
+
+def _normalize_visit_ids(problem_event_df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize visit ids per attempt when visit sequence is one-way only."""
+    group_cols = ["studentSessionId", "taskNumber", "attemptHlc"]
+    normalized_df = problem_event_df.copy()
+    normalized_df["visitId"] = normalized_df.groupby(
+        group_cols,
+        observed=True,
+        sort=False,
+    )["visitId"].transform(_collapse_visit_ids_if_no_backtracking)
+    return normalized_df
+
+
 def _handle_single_problem_logs(
     args: tuple[str, str, str, pd.DataFrame],
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -431,6 +491,12 @@ def _handle_single_problem_logs(
 
     """
     task_number, start_state, goal_state, problem_event_df = args
+
+    problem_event_df = problem_event_df.sort_values(
+        by=["studentSessionId", "taskNumber", "timestamp"]
+    )
+
+    problem_event_df = _normalize_visit_ids(problem_event_df)
 
     # get graph and student paths for problem
     _, student_G_dict, student_paths = make_problem_graph(

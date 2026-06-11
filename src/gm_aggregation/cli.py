@@ -48,6 +48,13 @@ def setup_parser() -> dict:
         action="store_true",
         help="Enable verbose logging",
     )
+    parser.add_argument(
+        "--convert-latex",
+        dest="convert_latex",
+        action="store_true",
+        help="Convert LaTeX states to ASCIIMath during event log preprocessing",
+    )
+    parser.set_defaults(convert_latex=False)
     return vars(parser.parse_args())
 
 
@@ -63,6 +70,7 @@ def main() -> int:
         input_path=args["input"],
         output_dir=args["output"],
         output_type=args["output_type"],
+        convert_latex=args["convert_latex"],
         n_jobs=args["njobs"],
         overwrite=args["overwrite"],
         verbose=args["verbose"],

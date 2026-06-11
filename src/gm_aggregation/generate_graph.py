@@ -24,6 +24,8 @@ IGNORE_RESET_REASON_TYPES = [
     AUTO_RESET,  # automatically reset by the system after completion
 ]
 logger = logging.getLogger("GM-Aggregator." + __name__)
+MISSING_NODE = "missing_node"
+MISSING_ACTION = "missing_action"
 
 
 def remove_edge_from_graph(
@@ -52,9 +54,18 @@ def add_edge_to_graph(
         attempt_count += 1
         G[prev_state][new_state]["attempt_count"] = attempt_count
     else:
+        weight = 1
+        if prev_state == MISSING_NODE or new_state == MISSING_NODE:
+            weight = (
+                10000  # assign high weight to transformations involving missing nodes
+            )
         # only 1 student has made this transformation so far
         G.add_edge(
-            prev_state, new_state, attempt_count=1, math_trans_type=math_trans_type
+            prev_state,
+            new_state,
+            attempt_count=1,
+            math_trans_type=math_trans_type,
+            weight=weight,
         )
     return G
 
@@ -125,6 +136,7 @@ def make_problem_graph(
         undo_action_stack: list[str] = []
         attempt_finished = False  # completed or reset
         reached_goal = False  # did student complete the problem?
+
         # loop over the events in the attempt to reconstruct the path
         for row in group_df.itertuples(index=False):
             if attempt_finished:
@@ -134,7 +146,12 @@ def make_problem_graph(
                 break
             event_type = row.eventType
             if event_type == EventLogTypes.MATH_STEP:
-                # todo convert to ascii math
+                if states[-1] != MISSING_NODE and states[-1] != row.oldState:
+                    states.append(
+                        MISSING_NODE
+                    )  # add a placeholder node for the unseen state
+                    actions.extend([MISSING_ACTION, MISSING_ACTION])
+                    states.append(row.oldState)
                 new_state = row.newState
                 states.append(new_state)
                 actions.append(row.actionName)
@@ -153,6 +170,11 @@ def make_problem_graph(
             elif event_type == EventLogTypes.REDO_STEP:
                 states.append(undo_state_stack.pop())
                 actions.append(undo_action_stack.pop())
+            else:
+                logger.warning(
+                    f"Event type {event_type} in attemptHlc {attemptHlc} for student {studentSessionId} is not recognized and will be ignored in the graph."
+                )
+                continue  # ignore other event types
         global_G, student_G = add_attempt_to_graphs(
             global_G, student_G, states, actions
         )
@@ -174,18 +196,21 @@ def make_problem_graph(
 
     try:
         optimal_paths = list(
-            nx.all_shortest_paths(global_G, start_state, goal_state, method="dijkstra")
+            nx.all_shortest_paths(
+                global_G, start_state, goal_state, method="dijkstra", weight="weight"
+            )
         )
         for path in optimal_paths:
             for i in range(0, len(path) - 1):
                 global_G[path[i]][path[i + 1]]["is_best_path"] = True
             path = path[1:-1]  # remove start and goal state
             for node in path:
-                global_G.nodes[node]["in_best_path"] = True
+                if node != MISSING_NODE:
+                    global_G.nodes[node]["in_best_path"] = True
         student_paths["optimal_paths"] = optimal_paths
         dead_end_nodes = []
         for node in global_G.nodes:
-            if not nx.has_path(global_G, node, goal_state):
+            if node != MISSING_NODE and not nx.has_path(global_G, node, goal_state):
                 global_G.nodes[node]["is_dead_end"] = True
                 dead_end_nodes.append(node)
         student_paths["dead_end_nodes"] = dead_end_nodes

@@ -6,6 +6,7 @@ Functions can be extended to add more complex preprocessing if needed.
 
 import pandas as pd
 import json
+import re
 from zipfile import ZipExtFile, ZipFile
 import logging
 import multiprocessing as mp
@@ -19,9 +20,10 @@ from .utils import (
     OUTPUT_TYPE,
     EventLogTypes,
 )
-from py_asciimath.translator.translator import Tex2ASCIIMath
+from py_asciimath.translator.translator import Tex2ASCIIMath, ASCIIMath2Tex
 
 tex2ascii_math = Tex2ASCIIMath(log=False, inplace=False)
+ascii2tex_math = ASCIIMath2Tex(log=False, inplace=False)
 logging.getLogger().setLevel(logging.ERROR)  # suppress py_asciimath logging
 logger = logging.getLogger("GM-Aggregator." + __name__)
 
@@ -39,6 +41,7 @@ VALID_ACTIONS = [
     EventLogTypes.MATH_STEP,
     EventLogTypes.UNDO_STEP,
     EventLogTypes.REDO_STEP,
+    EventLogTypes.MATH_MISTAKE,
 ]
 
 EVENT_LOG_TYPE_MAPPING = {
@@ -60,14 +63,38 @@ EVENT_LOG_TYPE_MAPPING = {
 }
 
 
-def latex_to_ascii_math(state):
+def convert_state(state, to_latex, converter):
     if pd.isna(state):
         return state
     else:
         try:
-            # try to translate LaTeX to ASCIIMath
-            translated_state = tex2ascii_math.translate(state, from_file=False)
-            translated_state = translated_state.replace(" ", "")
+            # try to translate between LaTeX and ASCIIMath
+            translated_state = converter.translate(state, from_file=False)
+            # remove $..$ as ASCIIMath2Tex wraps the whole expression in $..$
+            # also strip specific whitespaces to make it consistent with GMath logging
+            if to_latex:
+                # the following is needed to match the formatting of the latex converted strings
+                # to the ones logged by GMath, which have their own internal converter/fomatting
+                # it is computationally cheaper to do string replacements
+                # than to use ASTs and compare the structure
+                translated_state = translated_state.lstrip("$").rstrip("$")
+                translated_state = translated_state.replace(" ", "")
+                # Match GMath formatting where numeric coefficients are adjacent to variables,
+                # e.g. 15\cdot c+10 -> 15c+10 and 3\cdot 5\cdot c -> 3\cdot 5c.
+                translated_state = re.sub(
+                    r"(\d+)\\cdot(?=[A-Za-z])",
+                    r"\1",
+                    translated_state,
+                )
+                translated_state = re.sub(
+                    r"(?<=[A-Za-z])\\cdot(?=[A-Za-z])",
+                    "",
+                    translated_state,
+                )
+                translated_state = translated_state.replace("\\cdot", "\\cdot ")
+            else:
+                # remove whitespace in the asciimath
+                translated_state = translated_state.replace(" ", "")
             return translated_state
         except Exception as e:
             logger.warning(
@@ -76,7 +103,9 @@ def latex_to_ascii_math(state):
             return state
 
 
-def handle_latex_in_event_log(partial_event_log_df: pd.DataFrame) -> pd.DataFrame:
+def handle_latex_in_partial_event_log(
+    partial_event_log_df: pd.DataFrame,
+) -> pd.DataFrame:
     """Convert LaTeX in oldState and newState columns to ASCIIMath for better
     readability and easier parsing later on."""
     partial_event_log_df["oldState_latex"] = partial_event_log_df["oldState"].copy()
@@ -87,7 +116,7 @@ def handle_latex_in_event_log(partial_event_log_df: pd.DataFrame) -> pd.DataFram
     ] = partial_event_log_df.loc[
         partial_event_log_df["eventType"].isin(VALID_ACTIONS), "oldState"
     ].transform(
-        latex_to_ascii_math
+        lambda s: convert_state(s, to_latex=False, converter=tex2ascii_math)
     )
 
     partial_event_log_df.loc[
@@ -95,27 +124,16 @@ def handle_latex_in_event_log(partial_event_log_df: pd.DataFrame) -> pd.DataFram
     ] = partial_event_log_df.loc[
         partial_event_log_df["eventType"].isin(VALID_ACTIONS), "newState"
     ].transform(
-        latex_to_ascii_math
+        lambda s: convert_state(s, to_latex=False, converter=tex2ascii_math)
     )
     return partial_event_log_df
 
 
-def preprocess_and_save_event_log(
-    input: str | ZipFile,
-    output_dir: str,
-    output_type: OUTPUT_TYPE,
+def handle_latex_in_event_log(
+    event_log_df: pd.DataFrame,
     n_jobs: int = -1,
     progress_callback: ProgressCallback | None = None,
 ) -> pd.DataFrame:
-    """Preprocess event log data from GMA, i.e. event-logs.json from the research-data endpoint.
-    Return preprocessed event log dataframe for aggregation."""
-    logger.info("Starting Event Log Preprocessing..")
-    event_log_df = load_df_from_file(get_file(input, "event_logs"))
-    columns_to_remove = ["_id", "uid"]
-    event_log_df = event_log_df.drop(columns=columns_to_remove, errors="raise")
-    event_log_df["timestamp"] = pd.to_datetime(event_log_df["timestamp"])
-    # For consistency with previous MFL versions, we will convert Latex states into ASCIIMath.
-    # the latex column is retained.
     # all task numbers
     task_numbers = event_log_df["taskNumber"].unique()
     task_numbers = task_numbers[~pd.isna(task_numbers)]
@@ -148,7 +166,7 @@ def preprocess_and_save_event_log(
         ) as pbar,
     ):
         for completed, result in enumerate(
-            pool.imap_unordered(handle_latex_in_event_log, mp_jobs), start=1
+            pool.imap_unordered(handle_latex_in_partial_event_log, mp_jobs), start=1
         ):
             df_list_event_log.append(result)
             pbar.update()
@@ -162,6 +180,49 @@ def preprocess_and_save_event_log(
                     }
                 )
     event_log_df: pd.DataFrame = pd.concat(df_list_event_log, ignore_index=True)
+    if progress_callback is not None:
+        progress_callback(
+            {
+                "stage": "event_log_preprocessing",
+                "completed": total_tasks,
+                "total": total_tasks,
+                "message": "Finished event log preprocessing",
+            }
+        )
+    return event_log_df
+
+
+def preprocess_and_save_event_log(
+    input: str | ZipFile,
+    output_dir: str,
+    output_type: OUTPUT_TYPE,
+    convert_latex: bool = False,
+    n_jobs: int = -1,
+    progress_callback: ProgressCallback | None = None,
+) -> pd.DataFrame:
+    """Preprocess event log data from GMA, i.e. event-logs.json from the research-data endpoint.
+    Return preprocessed event log dataframe for aggregation."""
+    logger.info("Starting Event Log Preprocessing..")
+    event_log_df = load_df_from_file(get_file(input, "event_logs"))
+    columns_to_remove = ["_id", "uid"]
+    event_log_df = event_log_df.drop(columns=columns_to_remove, errors="raise")
+    event_log_df["timestamp"] = pd.to_datetime(event_log_df["timestamp"])
+    # For consistency with previous MFL versions, we will convert Latex states into ASCIIMath.
+    # the latex column is retained.
+    if convert_latex:
+        event_log_df = handle_latex_in_event_log(
+            event_log_df, n_jobs=n_jobs, progress_callback=progress_callback
+        )
+    elif progress_callback is not None:
+        progress_callback(
+            {
+                "stage": "event_log_preprocessing",
+                "completed": 1,
+                "total": 1,
+                "message": "Skipping LaTeX conversion",
+            }
+        )
+
     event_log_df.sort_values(
         by=["studentSessionId", "taskNumber", "timestamp"],
         inplace=True,
@@ -173,8 +234,8 @@ def preprocess_and_save_event_log(
         progress_callback(
             {
                 "stage": "event_log_preprocessing",
-                "completed": total_tasks,
-                "total": total_tasks,
+                "completed": 1,
+                "total": 1,
                 "message": "Finished event log preprocessing",
             }
         )
@@ -194,7 +255,9 @@ def preprocess_gma_attempt_data(gma_attempt_df: pd.DataFrame):
     return gma_attempt_df
 
 
-def preprocess_task_metadata(task_meta_df: pd.DataFrame):
+def preprocess_task_metadata(
+    task_meta_df: pd.DataFrame, convert_latex: bool
+) -> pd.DataFrame:
     """Preprocess task metadata and keep only information from the latest session.
 
     Args:
@@ -216,6 +279,18 @@ def preprocess_task_metadata(task_meta_df: pd.DataFrame):
         "hintDelta",
     ]
     task_meta_df = task_meta_df.drop(columns=columns_to_remove, errors="raise")
+    # task_meta_df has states in asciimath (IDK ask GM team why)
+    if not convert_latex:
+        # convert so we can string compare
+        task_meta_df["startState_asciimath"] = task_meta_df["startState"].copy()
+        task_meta_df["goalState_asciimath"] = task_meta_df["goalState"].copy()
+        task_meta_df["startState"] = task_meta_df["startState"].transform(
+            lambda s: convert_state(s, to_latex=True, converter=ascii2tex_math)
+        )
+        task_meta_df["goalState"] = task_meta_df["goalState"].transform(
+            lambda s: convert_state(s, to_latex=True, converter=ascii2tex_math)
+        )
+
     return task_meta_df
 
 
@@ -252,14 +327,15 @@ def save_study_metadata(input: str | ZipFile, output_dir: str):
 
 
 def preprocess_and_save_metadata(
-    input: str | ZipFile, output_dir: str, output_type: OUTPUT_TYPE
-):
+    input: str | ZipFile, output_dir: str, output_type: OUTPUT_TYPE, convert_latex: bool
+) -> pd.DataFrame | None:
     """Preprocess and save metadata, i.e., Roster, Task, and Study
     Study metadata is saved as a simple .txt file for quick reference.
     Args:
         input (str | ZipExtFile): Location of input data, either a directory or a ZipFile object
         output_dir (str): Directory to save the preprocessed metadata
         output_type (OUTPUT_TYPE): Format to save the preprocessed metadata
+        convert_latex (bool): Whether to convert LaTeX to ASCII math
     """
     # save initial study metadata
     # other study-level info will be added during aggregation
@@ -281,7 +357,7 @@ def preprocess_and_save_metadata(
                 output_type=output_type,
             )
         task_meta_df = load_df_from_file(get_file(input, "task"))
-        task_meta_df = preprocess_task_metadata(task_meta_df)
+        task_meta_df = preprocess_task_metadata(task_meta_df, convert_latex)
         logger.info(f"Number of Tasks: {task_meta_df.shape[0]}")
         logger.info("Saving Task Metadata...")
         logger.debug(f"Task Metadata Columns: {task_meta_df.columns}")
@@ -294,3 +370,4 @@ def preprocess_and_save_metadata(
         return task_meta_df
     except Exception as e:
         logger.error(f"Error while preprocessing metadata: {e}")
+        raise e
