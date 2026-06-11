@@ -163,6 +163,7 @@ def handle_latex_in_event_log(
             total=len(mp_jobs),
             desc="Preprocessing States in Event Log",
             unit="problem",
+            disable=None,
         ) as pbar,
     ):
         for completed, result in enumerate(
@@ -192,18 +193,12 @@ def handle_latex_in_event_log(
     return event_log_df
 
 
-def preprocess_and_save_event_log(
-    input: str | ZipFile,
-    output_dir: str,
-    output_type: OUTPUT_TYPE,
+def preprocess_event_log(
+    event_log_df: pd.DataFrame,
     convert_latex: bool = False,
     n_jobs: int = -1,
     progress_callback: ProgressCallback | None = None,
 ) -> pd.DataFrame:
-    """Preprocess event log data from GMA, i.e. event-logs.json from the research-data endpoint.
-    Return preprocessed event log dataframe for aggregation."""
-    logger.info("Starting Event Log Preprocessing..")
-    event_log_df = load_df_from_file(get_file(input, "event_logs"))
     columns_to_remove = ["_id", "uid"]
     event_log_df = event_log_df.drop(columns=columns_to_remove, errors="raise")
     event_log_df["timestamp"] = pd.to_datetime(event_log_df["timestamp"])
@@ -229,6 +224,28 @@ def preprocess_and_save_event_log(
         ignore_index=True,
     )
     event_log_df = set_event_log_types(event_log_df)
+    return event_log_df
+
+
+def preprocess_and_save_event_log(
+    input: str | ZipFile,
+    output_dir: str,
+    output_type: OUTPUT_TYPE,
+    convert_latex: bool = False,
+    n_jobs: int = -1,
+    progress_callback: ProgressCallback | None = None,
+) -> pd.DataFrame:
+    """Preprocess event log data from GMA, i.e. event-logs.json from the research-data endpoint.
+    Return preprocessed event log dataframe for aggregation."""
+    logger.info("Starting Event Log Preprocessing..")
+    event_log_df = load_df_from_file(get_file(input, "event_logs"))
+    event_log_df = preprocess_event_log(
+        event_log_df,
+        convert_latex=convert_latex,
+        n_jobs=n_jobs,
+        progress_callback=progress_callback,
+    )
+
     save_df(event_log_df, "event_logs", output_dir, output_type=output_type)
     if progress_callback is not None:
         progress_callback(

@@ -239,6 +239,7 @@ def aggregate_event_log(
             total=len(mp_jobs),
             desc="Aggregating Event Logs To Attempt Level",
             unit="problem",
+            disable=None,
         ) as pbar,
     ):
         for completed, result in enumerate(
@@ -486,8 +487,7 @@ def _handle_single_problem_logs(
 
 
     Returns:
-        tuple[pd.DataFrame, pd.DataFrame, nx.DiGraph]: DataFrames aggregated to attempt level and student-problem level for a single problem,
-        and a directed graph needed for Sid's classifications.
+        tuple[pd.DataFrame, pd.DataFrame]: DataFrames aggregated to attempt level and student-problem level for a single problem.
 
     """
     task_number, start_state, goal_state, problem_event_df = args
@@ -693,7 +693,7 @@ def _sum_delta_times_under_5_min(delta_times: pd.Series) -> float | None:
     """Sum delta times that are less than 5 minutes."""
     # Filter delta times less than 5 minutes (300 seconds)
     valid_times: pd.Series[pd.Timedelta] = delta_times[
-        delta_times < pd.Timedelta(minutes=5, unit="ms")
+        delta_times < pd.Timedelta(minutes=5)
     ]
 
     if len(valid_times) == 0:

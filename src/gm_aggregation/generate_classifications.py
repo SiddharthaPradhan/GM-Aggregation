@@ -9,7 +9,6 @@ Individual classifications are based only on the students' own attempts and path
 """
 
 import pandas as pd
-from tqdm import tqdm
 import multiprocessing as mp
 import networkx as nx
 
