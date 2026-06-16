@@ -55,6 +55,21 @@ def setup_parser() -> dict:
         help="Convert LaTeX states to ASCIIMath during event log preprocessing",
     )
     parser.set_defaults(convert_latex=False)
+    parser.add_argument(
+        "--memory-limit",
+        dest="memory_limit",
+        type=str,
+        default="6GB",
+        help="Total Dask memory budget across all workers (e.g. 800MB, 1GB). "
+        "Excess is spilled to disk. Default: 6GB.",
+    )
+    parser.add_argument(
+        "--dask",
+        dest="use_dask",
+        action="store_true",
+        help="Enable Dask for parallel processing.",
+    )
+    parser.set_defaults(use_dask=False)
     return vars(parser.parse_args())
 
 
@@ -75,6 +90,8 @@ def main() -> int:
         overwrite=args["overwrite"],
         verbose=args["verbose"],
         logger=logger,
+        memory_limit=args["memory_limit"],
+        use_dask=args["use_dask"],
     )
 
     return 0

@@ -17,6 +17,7 @@ from .utils import (
 import networkx as nx
 from .generate_graph import make_problem_graph
 from .generate_classifications import process_problem_classification
+from .preprocess import TaskSplitEventLog
 
 logger = logging.getLogger("GM-Aggregator." + __name__)
 
@@ -138,6 +139,7 @@ def aggregate_and_save(
     output_type: OUTPUT_TYPE,
     n_jobs: int = -1,
     progress_callback: ProgressCallback | None = None,
+    dask_client=None,
 ):
     """Aggregates the event log data to the attempt, student-problem, student, problem and overall levels.
 
@@ -151,6 +153,7 @@ def aggregate_and_save(
         task_metadata_df,
         n_jobs=n_jobs,
         progress_callback=progress_callback,
+        dask_client=dask_client,
     )
     logger.debug("Finished Attempt and Student-Problem Level Aggregation..")
 
@@ -189,6 +192,7 @@ def aggregate_event_log(
     task_metadata_df: pd.DataFrame,
     n_jobs: int = -1,
     progress_callback: ProgressCallback | None = None,
+    dask_client=None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Aggregate event log data to attempt level and student-problem level.
 
@@ -200,9 +204,15 @@ def aggregate_event_log(
         tuple[pd.DataFrame, pd.DataFrame]: DataFrames aggregated to attempt level and student-problem level.
     """
 
-    # all task numbers
-    task_numbers = event_log_df["taskNumber"].unique()
-    task_numbers = task_numbers[~np.isnan(task_numbers)]
+    # all task numbers — handle both a plain pandas DataFrame and a
+    # TaskSplitEventLog (per-task files already split out on disk)
+    _is_split = isinstance(event_log_df, TaskSplitEventLog)
+
+    if _is_split:
+        task_numbers = list(event_log_df.task_files.keys())
+    else:
+        task_numbers = event_log_df["taskNumber"].unique()
+        task_numbers = task_numbers[~np.isnan(task_numbers)]
     total_tasks = len(task_numbers)
     if progress_callback is not None:
         progress_callback(
@@ -214,50 +224,101 @@ def aggregate_event_log(
             }
         )
 
-    mp_jobs = []
-    # mp_jobs contains: task_number, start_state, goal_state, problem_event_df
-    for task_number in task_numbers:
-        mp_jobs.append(
-            (
-                task_number,
-                *get_start_goal_state(task_metadata_df, task_number),
-                event_log_df.loc[event_log_df["taskNumber"] == task_number].copy(),
-            )
-        )
-    if n_jobs == -1:
-        num_processes = None  # Use all available cores
-    else:
-        num_processes = min(n_jobs, len(mp_jobs))
     df_list_attempt = []
     df_list_student_problem = []
-    # this applies the _aggregate_single_problem_logs function to each problem in parallel
-    # Sid decided to use pandas and use multiprocessing rather than using
-    # Polars to make it easier for others later down the line
-    with (
-        mp.get_context("spawn").Pool(processes=num_processes) as pool,
-        tqdm(
-            total=len(mp_jobs),
+
+    if dask_client is not None:
+        from dask.distributed import as_completed as dask_as_completed
+
+        # Lazy submission: only keep a small window of serialised task DataFrames
+        # in the scheduler at once so we never hold all N copies in memory.
+        n_concurrent = len(dask_client.nthreads()) * 2
+        task_iter = iter(task_numbers)
+
+        def _submit_next():
+            try:
+                tn = next(task_iter)
+                # TaskSplitEventLog: read this task's already-split small
+                # file directly (fast, no full-file rescan). Plain
+                # DataFrame: standard loc filter.
+                if _is_split:
+                    task_df = event_log_df.read_task(tn)
+                else:
+                    task_df = event_log_df.loc[event_log_df["taskNumber"] == tn].copy()
+                job = (tn, *get_start_goal_state(task_metadata_df, tn), task_df)
+                return dask_client.submit(_handle_single_problem_logs, job, pure=False)
+            except StopIteration:
+                return None
+
+        initial = [
+            f
+            for f in (_submit_next() for _ in range(min(n_concurrent, total_tasks)))
+            if f is not None
+        ]
+        ac = dask_as_completed(initial)
+
+        with tqdm(
+            total=total_tasks,
             desc="Aggregating Event Logs To Attempt Level",
             unit="problem",
             disable=None,
-        ) as pbar,
-    ):
-        for completed, result in enumerate(
-            pool.imap_unordered(_handle_single_problem_logs, mp_jobs), start=1
-        ):
-            pbar.update()
-            pbar.refresh()
-            partial_attempt_level_df, partial_student_problem_df = result
-            df_list_attempt.append(partial_attempt_level_df)
-            df_list_student_problem.append(partial_student_problem_df)
-            if progress_callback is not None:
-                progress_callback(
-                    {
-                        "stage": "aggregation",
-                        "completed": completed,
-                        "total": total_tasks,
-                    }
+        ) as pbar:
+            for n_done, future in enumerate(ac, start=1):
+                partial_attempt_level_df, partial_student_problem_df = future.result()
+                df_list_attempt.append(partial_attempt_level_df)
+                df_list_student_problem.append(partial_student_problem_df)
+                pbar.update()
+                pbar.refresh()
+                if progress_callback is not None:
+                    progress_callback(
+                        {
+                            "stage": "aggregation",
+                            "completed": n_done,
+                            "total": total_tasks,
+                        }
+                    )
+                next_f = _submit_next()
+                if next_f is not None:
+                    ac.add(next_f)
+
+        if _is_split:
+            event_log_df.cleanup()
+    else:
+        mp_jobs = []
+        for task_number in task_numbers:
+            mp_jobs.append(
+                (
+                    task_number,
+                    *get_start_goal_state(task_metadata_df, task_number),
+                    event_log_df.loc[event_log_df["taskNumber"] == task_number].copy(),
                 )
+            )
+        num_processes = None if n_jobs == -1 else min(n_jobs, len(mp_jobs))
+        with (
+            mp.get_context("spawn").Pool(processes=num_processes) as pool,
+            tqdm(
+                total=len(mp_jobs),
+                desc="Aggregating Event Logs To Attempt Level",
+                unit="problem",
+                disable=None,
+            ) as pbar,
+        ):
+            for completed, result in enumerate(
+                pool.imap_unordered(_handle_single_problem_logs, mp_jobs), start=1
+            ):
+                pbar.update()
+                pbar.refresh()
+                partial_attempt_level_df, partial_student_problem_df = result
+                df_list_attempt.append(partial_attempt_level_df)
+                df_list_student_problem.append(partial_student_problem_df)
+                if progress_callback is not None:
+                    progress_callback(
+                        {
+                            "stage": "aggregation",
+                            "completed": completed,
+                            "total": total_tasks,
+                        }
+                    )
     attempt_level_df = pd.concat(df_list_attempt, ignore_index=True)
     student_problem_df = pd.concat(df_list_student_problem, ignore_index=True)
     attempt_level_df = attempt_level_df.sort_values(

@@ -3,6 +3,8 @@
 from pathlib import Path
 import logging
 import os
+import shutil
+import tempfile
 from typing import Callable, TypedDict
 
 from .aggregate import aggregate_and_save
@@ -25,13 +27,18 @@ def run(
     output_dir: str | os.PathLike = "./output",
     output_type: OUTPUT_TYPE = "csv",
     convert_latex: bool = False,
-    n_jobs: int = -1,
+    n_jobs: int = 1,
     overwrite: bool = False,
     verbose: bool = False,
     logger: logging.Logger | None = None,
     progress_callback: ProgressCallback | None = None,
+    memory_limit: str = "800MB",
+    use_dask: bool = True,
 ) -> tuple[str, Path]:
     """Run preprocessing + aggregation pipeline and return (study_id, output_dir)."""
+    if n_jobs == -1:
+        n_jobs = os.cpu_count() or 1
+        n_jobs = n_jobs - 1 if n_jobs > 1 else 1
     input_path = str(input_path)
     output_root = Path(output_dir)
 
@@ -103,22 +110,53 @@ def run(
             }
         )
 
-    event_log_df = preprocess_and_save_event_log(
-        input_file,
-        str(study_output_dir),
-        output_type,
-        convert_latex=convert_latex,
-        n_jobs=n_jobs,
-        progress_callback=progress_callback,
-    )
-    aggregate_and_save(
-        event_log_df,
-        task_meta_df,
-        str(study_output_dir),
-        output_type,
-        n_jobs=n_jobs,
-        progress_callback=progress_callback,
-    )
+    def _run_stages(dask_client) -> None:
+        event_log_df = preprocess_and_save_event_log(
+            input_file,
+            str(study_output_dir),
+            output_type,
+            convert_latex=convert_latex,
+            n_jobs=n_jobs,
+            progress_callback=progress_callback,
+            dask_client=dask_client,
+        )
+        aggregate_and_save(
+            event_log_df,
+            task_meta_df,
+            str(study_output_dir),
+            output_type,
+            n_jobs=n_jobs,
+            progress_callback=progress_callback,
+            dask_client=dask_client,
+        )
+
+    if use_dask:
+        n_workers = max(1, n_jobs)
+        spill_dir = tempfile.mkdtemp(prefix="dask-spill-")
+        try:
+            from dask.distributed import Client, LocalCluster
+            from dask.utils import parse_bytes
+
+            per_worker_bytes = parse_bytes(memory_limit) // n_workers
+            cluster = LocalCluster(
+                n_workers=n_workers,
+                threads_per_worker=1,
+                memory_limit=per_worker_bytes,
+                local_directory=spill_dir,
+                silence_logs=logging.WARNING,
+            )
+            logger.info(
+                f"Dask cluster: {n_workers} worker(s), "
+                f"{memory_limit} total memory limit, spill → {spill_dir}"
+            )
+
+            with Client(cluster) as dask_client:
+                _run_stages(dask_client)
+        finally:
+            shutil.rmtree(spill_dir, ignore_errors=True)
+    else:
+        logger.info("Dask disabled — using pandas/multiprocessing path")
+        _run_stages(dask_client=None)
 
     logger.info(f"All processed files saved to {study_output_dir}")
     logger.info("Finished..")

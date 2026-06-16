@@ -4,6 +4,7 @@ Most of these functions are simple column removals and filtering.
 Functions can be extended to add more complex preprocessing if needed.
 """
 
+import os
 import pandas as pd
 import json
 import re
@@ -19,6 +20,7 @@ from .utils import (
     get_file,
     OUTPUT_TYPE,
     EventLogTypes,
+    CONTENT_DICT,
 )
 from py_asciimath.translator.translator import Tex2ASCIIMath, ASCIIMath2Tex
 
@@ -133,6 +135,7 @@ def handle_latex_in_event_log(
     event_log_df: pd.DataFrame,
     n_jobs: int = -1,
     progress_callback: ProgressCallback | None = None,
+    dask_client=None,
 ) -> pd.DataFrame:
     # all task numbers
     task_numbers = event_log_df["taskNumber"].unique()
@@ -147,39 +150,84 @@ def handle_latex_in_event_log(
                 "message": "Starting event log preprocessing",
             }
         )
-    mp_jobs = []
-    for task_number in task_numbers:
-        mp_jobs.append(
-            event_log_df.loc[event_log_df["taskNumber"] == task_number].copy(),
-        )
-        if n_jobs == -1:
-            num_processes = None  # Use all available cores
-        else:
-            num_processes = min(n_jobs, len(mp_jobs))
-        df_list_event_log = []
-    with (
-        mp.get_context("spawn").Pool(processes=num_processes) as pool,
-        tqdm(
-            total=len(mp_jobs),
+    df_list_event_log = []
+
+    if dask_client is not None:
+        from dask.distributed import as_completed as dask_as_completed
+
+        n_concurrent = len(dask_client.nthreads()) * 2
+        task_iter = iter(task_numbers)
+
+        def _submit_next():
+            try:
+                tn = next(task_iter)
+                return dask_client.submit(
+                    handle_latex_in_partial_event_log,
+                    event_log_df.loc[event_log_df["taskNumber"] == tn].copy(),
+                    pure=False,
+                )
+            except StopIteration:
+                return None
+
+        initial = [
+            f
+            for f in (_submit_next() for _ in range(min(n_concurrent, total_tasks)))
+            if f is not None
+        ]
+        ac = dask_as_completed(initial)
+
+        with tqdm(
+            total=total_tasks,
             desc="Preprocessing States in Event Log",
             unit="problem",
             disable=None,
-        ) as pbar,
-    ):
-        for completed, result in enumerate(
-            pool.imap_unordered(handle_latex_in_partial_event_log, mp_jobs), start=1
+        ) as pbar:
+            for completed, future in enumerate(ac, start=1):
+                df_list_event_log.append(future.result())
+                pbar.update()
+                pbar.refresh()
+                if progress_callback is not None:
+                    progress_callback(
+                        {
+                            "stage": "event_log_preprocessing",
+                            "completed": completed,
+                            "total": total_tasks,
+                        }
+                    )
+                next_f = _submit_next()
+                if next_f is not None:
+                    ac.add(next_f)
+    else:
+        mp_jobs = []
+        for task_number in task_numbers:
+            mp_jobs.append(
+                event_log_df.loc[event_log_df["taskNumber"] == task_number].copy(),
+            )
+        num_processes = None if n_jobs == -1 else min(n_jobs, len(mp_jobs))
+        with (
+            mp.get_context("spawn").Pool(processes=num_processes) as pool,
+            tqdm(
+                total=len(mp_jobs),
+                desc="Preprocessing States in Event Log",
+                unit="problem",
+                disable=None,
+            ) as pbar,
         ):
-            df_list_event_log.append(result)
-            pbar.update()
-            pbar.refresh()
-            if progress_callback is not None:
-                progress_callback(
-                    {
-                        "stage": "event_log_preprocessing",
-                        "completed": completed,
-                        "total": total_tasks,
-                    }
-                )
+            for completed, result in enumerate(
+                pool.imap_unordered(handle_latex_in_partial_event_log, mp_jobs), start=1
+            ):
+                df_list_event_log.append(result)
+                pbar.update()
+                pbar.refresh()
+                if progress_callback is not None:
+                    progress_callback(
+                        {
+                            "stage": "event_log_preprocessing",
+                            "completed": completed,
+                            "total": total_tasks,
+                        }
+                    )
+
     event_log_df: pd.DataFrame = pd.concat(df_list_event_log, ignore_index=True)
     if progress_callback is not None:
         progress_callback(
@@ -193,11 +241,259 @@ def handle_latex_in_event_log(
     return event_log_df
 
 
+def _discover_ndjson_columns(path: str) -> list[str]:
+    """Scan an NDJSON file once to collect the union of all keys (in first-seen
+    order) across every record, without materializing any rows.
+
+    GMA event log records serialise their keys in different orders depending
+    on event type, which breaks dd.read_json's schema inference (it infers a
+    fixed column order from the first chunk and rejects any later chunk whose
+    inferred order differs, even though the same columns are all present).
+    Scanning once up front with json.loads is cheap (a few seconds even for
+    1M+ lines) and gives a single canonical column order every chunk can be
+    reindexed to.
+    """
+    columns: dict[str, None] = {}
+    with open(path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            record = json.loads(line)
+            for key in record.keys():
+                columns.setdefault(key, None)
+    return list(columns.keys())
+
+
+def _ndjson_chunk_boundaries(path: str, blocksize: int) -> list[tuple[int, int]]:
+    """Compute (start, end) byte offsets covering *path*, each aligned to a
+    complete NDJSON line (never splitting a JSON record across chunks)."""
+    file_size = os.path.getsize(path)
+    boundaries = []
+    with open(path, "rb") as f:
+        pos = 0
+        while pos < file_size:
+            end = min(pos + blocksize, file_size)
+            if end < file_size:
+                f.seek(end)
+                f.readline()  # consume the partial line to land on a boundary
+                end = f.tell()
+            boundaries.append((pos, end))
+            pos = end
+    return boundaries
+
+
+def _read_ndjson_block(
+    path: str, start: int, end: int, columns: list[str]
+) -> pd.DataFrame:
+    """Read one byte-range chunk of an NDJSON file and reindex it to *columns*
+    so every chunk has an identical, predictable column order regardless of
+    the order keys happened to be serialised in for that chunk's records."""
+    from io import BytesIO
+
+    with open(path, "rb") as f:
+        f.seek(start)
+        data = f.read(end - start)
+    df = pd.read_json(BytesIO(data), lines=True)
+
+    return df.reindex(columns=columns)
+
+
+_NUMERIC_RAW_COLUMNS = {"taskNumber", "attemptNumber", "steps", "stars", "dx", "dy"}
+_BOOLEAN_RAW_COLUMNS = {"wasSolved", "dropClosestToSelf"}
+
+# Columns genuinely required downstream (generate_graph.py reads
+# row.oldState/row.newState/row.actionName per event) but absent from
+# EVENT_LOG_TYPE_MAPPING, which only lists columns kept through to the
+# final typed output. _fill_optional_columns must protect these too, or a
+# record set that's missing one of them entirely raises a KeyError /
+# AttributeError deep in graph building rather than failing gracefully.
+_REQUIRED_UNTYPED_COLUMNS = {
+    "oldState": "object",
+    "newState": "object",
+    "actionName": "object",
+}
+
+
+def _raw_csv_dtype_map(columns) -> dict:
+    """Explicit dtype overrides for the preprocessed event log.
+
+    Plain numpy/pandas dtypes (not pyarrow ones) avoid a null-type mismatch
+    seen earlier: a chunk where an optional column like 'mistake' is
+    entirely empty infers as null[pyarrow], while a chunk with real values
+    infers as string[pyarrow] — float64 naturally represents missing
+    numeric values as NaN instead, and "boolean" is pandas' own nullable
+    boolean extension type.
+
+    Columns marked "category" in EVENT_LOG_TYPE_MAPPING use that here too:
+    low-cardinality, highly-repeated string columns (eventType, attemptHlc,
+    studentSessionId, mistake, reason, etc.) are stored once per unique
+    value plus a small integer code per row, instead of a full Python
+    string object per row — the single biggest lever for this data's
+    memory footprint, since most of these ~28 columns are otherwise object
+    dtype. It's safe to apply per chunk here (each chunk gets its own local
+    category set) because, unlike the earlier Dask DataFrame design, there
+    is no cross-chunk meta validation requiring identical categories.
+    """
+    dtype_map = {}
+    for col in columns:
+        if col == "timestamp":
+            continue  # parsed separately via dd.to_datetime
+        elif col in _NUMERIC_RAW_COLUMNS:
+            dtype_map[col] = "float64"
+        elif col in _BOOLEAN_RAW_COLUMNS:
+            dtype_map[col] = "boolean"
+        elif EVENT_LOG_TYPE_MAPPING.get(col) == "category":
+            dtype_map[col] = "category"
+        else:
+            dtype_map[col] = "object"
+    return dtype_map
+
+
+class TaskSplitEventLog:
+    """Marker object returned by preprocess_and_save_event_log in place of a
+    DataFrame: maps each taskNumber to the path of a small CSV file
+    containing only that task's rows, plus the directory holding them (for
+    cleanup once aggregation is done reading them).
+
+    This avoids two failure modes seen with a single Dask-backed lazy
+    DataFrame: persist() must hold every partition in the worker's memory
+    at once (OOM risk on a tight budget), while staying fully lazy means
+    re-scanning the *entire* event log from disk once per task during
+    aggregation (catastrophically slow — O(n_tasks * file_size) instead of
+    O(file_size)). Splitting once up front is a single linear pass, and
+    each task then reads only its own small file.
+    """
+
+    def __init__(self, task_files: dict, split_dir: str, dtype_map: dict):
+        self.task_files = task_files
+        self.split_dir = split_dir
+        self.dtype_map = dtype_map
+
+    def read_task(self, task_number) -> pd.DataFrame:
+        df = pd.read_csv(self.task_files[task_number], dtype=self.dtype_map)
+        df["timestamp"] = pd.to_datetime(df["timestamp"], format="mixed")
+        return df
+
+    def cleanup(self) -> None:
+        import shutil
+
+        shutil.rmtree(self.split_dir, ignore_errors=True)
+
+
+def _process_event_log_single_pass(
+    ndjson_path: str,
+    output_dir: str,
+    output_type: OUTPUT_TYPE,
+    blocksize: int = 32 * 1024 * 1024,
+) -> "TaskSplitEventLog":
+    """Read the raw NDJSON event log exactly once, chunk by chunk, and in the
+    same pass: preprocess each chunk, write it to the canonical CSV (if
+    requested), write it to SQLite (if requested), and split it into
+    per-task files for aggregation to read from later.
+    """
+    import sqlite3
+    import tempfile
+
+    columns = _discover_ndjson_columns(ndjson_path)
+    boundaries = _ndjson_chunk_boundaries(ndjson_path, blocksize)
+
+    write_csv = output_type in ("csv", "both")
+    write_sqlite = output_type in ("sqlite", "both")
+    working_csv_path = os.path.join(output_dir, "event_logs.csv")
+
+    split_dir = tempfile.mkdtemp(prefix="task-split-")
+    open_task_files: dict = {}  # task_number -> (file_path, file_handle)
+    dtype_map: dict | None = None
+    csv_file = None
+    sqlite_conn = None
+    csv_header_written = False
+    sqlite_first_write = True
+
+    try:
+        if write_csv:
+            csv_file = open(working_csv_path, "w", newline="")
+        if write_sqlite:
+            sqlite_conn = sqlite3.connect(os.path.join(output_dir, "GMA_data.db"))
+
+        for start, end in boundaries:
+            chunk = _read_ndjson_block(ndjson_path, start, end, columns)
+            chunk = chunk.drop(columns=["_id", "uid"], errors="ignore")
+            chunk["timestamp"] = pd.to_datetime(chunk["timestamp"], format="mixed")
+            chunk = _fill_optional_columns(chunk)
+
+            if dtype_map is None:
+                dtype_map = _raw_csv_dtype_map(list(chunk.columns))
+
+            for col, dtype in dtype_map.items():
+                if col in chunk.columns:
+                    chunk[col] = chunk[col].astype(dtype)
+
+            if csv_file is not None:
+                chunk.to_csv(csv_file, index=False, header=not csv_header_written)
+                csv_header_written = True
+
+            if sqlite_conn is not None:
+                chunk.to_sql(
+                    "event_logs",
+                    sqlite_conn,
+                    if_exists="replace" if sqlite_first_write else "append",
+                    index=False,
+                )
+                sqlite_first_write = False
+
+                sqlite_conn.commit()
+
+            for task_number, group in chunk.groupby("taskNumber"):
+                if task_number not in open_task_files:
+                    file_path = os.path.join(split_dir, f"task_{task_number}.csv")
+                    f = open(file_path, "w", newline="")
+                    group.to_csv(f, index=False)
+                    open_task_files[task_number] = (file_path, f)
+                else:
+                    _, f = open_task_files[task_number]
+                    group.to_csv(f, index=False, header=False)
+    finally:
+        if csv_file is not None:
+            csv_file.close()
+        if sqlite_conn is not None:
+            sqlite_conn.close()
+        for _, f in open_task_files.values():
+            f.close()
+
+    task_files = {tn: fp for tn, (fp, _) in open_task_files.items()}
+    return TaskSplitEventLog(task_files, split_dir, dtype_map or {})
+
+
+def _fill_optional_columns(df):
+    """Add any columns from EVENT_LOG_TYPE_MAPPING that are absent in df as all-NA.
+
+    Works on both pandas DataFrames and Dask DataFrames. Pandas columns are
+    initialised with the correct nullable pyarrow dtype; Dask columns are set to
+    a scalar None (the dtype is resolved when each partition is computed).
+    """
+    try:
+        import dask.dataframe as _dd
+
+        is_dask = isinstance(df, _dd.DataFrame)
+    except ImportError:
+        is_dask = False
+
+    for col, dtype in {**EVENT_LOG_TYPE_MAPPING, **_REQUIRED_UNTYPED_COLUMNS}.items():
+        if col not in df.columns:
+            if is_dask:
+                df[col] = None
+            else:
+                df[col] = pd.array([pd.NA] * len(df), dtype=dtype)
+    return df
+
+
 def preprocess_event_log(
     event_log_df: pd.DataFrame,
     convert_latex: bool = False,
     n_jobs: int = -1,
     progress_callback: ProgressCallback | None = None,
+    dask_client=None,
 ) -> pd.DataFrame:
     columns_to_remove = ["_id", "uid"]
     event_log_df = event_log_df.drop(columns=columns_to_remove, errors="raise")
@@ -206,7 +502,10 @@ def preprocess_event_log(
     # the latex column is retained.
     if convert_latex:
         event_log_df = handle_latex_in_event_log(
-            event_log_df, n_jobs=n_jobs, progress_callback=progress_callback
+            event_log_df,
+            n_jobs=n_jobs,
+            progress_callback=progress_callback,
+            dask_client=dask_client,
         )
     elif progress_callback is not None:
         progress_callback(
@@ -218,6 +517,7 @@ def preprocess_event_log(
             }
         )
 
+    event_log_df = _fill_optional_columns(event_log_df)
     event_log_df.sort_values(
         by=["studentSessionId", "taskNumber", "timestamp"],
         inplace=True,
@@ -234,18 +534,66 @@ def preprocess_and_save_event_log(
     convert_latex: bool = False,
     n_jobs: int = -1,
     progress_callback: ProgressCallback | None = None,
-) -> pd.DataFrame:
+    dask_client=None,
+):
     """Preprocess event log data from GMA, i.e. event-logs.json from the research-data endpoint.
-    Return preprocessed event log dataframe for aggregation."""
+    Returns a TaskSplitEventLog (per-task files already split out on disk) when a Dask client
+    is provided, this is what aggregate_event_log reads from. For zip inputs the event log is
+    streamed to a temp file first since processing needs a file path. Falls back to a pandas
+    DataFrame only when LaTeX conversion is needed.
+    """
     logger.info("Starting Event Log Preprocessing..")
-    event_log_df = load_df_from_file(get_file(input, "event_logs"))
+
+    use_single_pass = dask_client is not None and not convert_latex
+
+    if use_single_pass:
+        import shutil
+        import tempfile
+
+        tmp_path = None
+        if isinstance(input, ZipFile):
+            # The single-pass processor needs a file path, not a file object.
+            # Stream the zip member to a temp file so we never load it all
+            # into memory at once (shutil.copyfileobj copies in 16KB chunks).
+            tmp = tempfile.NamedTemporaryFile(suffix=".ndjson", delete=False)
+            try:
+                with input.open(CONTENT_DICT["event_logs"]) as zf:
+                    shutil.copyfileobj(zf, tmp)
+            finally:
+                tmp.close()
+            tmp_path = tmp.name
+            event_log_path = tmp_path
+        else:
+            event_log_path = os.path.join(input, CONTENT_DICT["event_logs"])
+
+        try:
+            task_split = _process_event_log_single_pass(
+                event_log_path, output_dir, output_type
+            )
+        finally:
+            if tmp_path is not None:
+                os.unlink(tmp_path)
+
+        if progress_callback is not None:
+            progress_callback(
+                {
+                    "stage": "event_log_preprocessing",
+                    "completed": 1,
+                    "total": 1,
+                    "message": "Finished event log preprocessing",
+                }
+            )
+        return task_split
+
+    # Fallback: LaTeX conversion — use pandas
+    event_log_df = load_df_from_file(get_file(input, "event_logs"), lines=True)
     event_log_df = preprocess_event_log(
         event_log_df,
         convert_latex=convert_latex,
         n_jobs=n_jobs,
         progress_callback=progress_callback,
+        dask_client=dask_client,
     )
-
     save_df(event_log_df, "event_logs", output_dir, output_type=output_type)
     if progress_callback is not None:
         progress_callback(
@@ -360,9 +708,8 @@ def preprocess_and_save_metadata(
     # Roster Metadata
     logger.info("Starting Metadata Preprocessing..")
     try:
-        roster_meta_df = load_df_from_file(get_file(input, "roster"))
+        roster_meta_df = load_df_from_file(get_file(input, "roster"), lines=False)
         roster_meta_df = preprocess_roster_metadata(roster_meta_df)
-
         if roster_meta_df is not None:  # save only non-public-session studies
             logger.info(f"Number of Students in Roster: {roster_meta_df.shape[0]}")
             logger.info("Saving Roster Metadata...")
@@ -373,7 +720,7 @@ def preprocess_and_save_metadata(
                 output_dir,
                 output_type=output_type,
             )
-        task_meta_df = load_df_from_file(get_file(input, "task"))
+        task_meta_df = load_df_from_file(get_file(input, "task"), lines=True)
         task_meta_df = preprocess_task_metadata(task_meta_df, convert_latex)
         logger.info(f"Number of Tasks: {task_meta_df.shape[0]}")
         logger.info("Saving Task Metadata...")

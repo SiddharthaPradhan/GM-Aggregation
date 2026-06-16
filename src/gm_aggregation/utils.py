@@ -12,9 +12,9 @@ FILE_KEY_TYPE = Literal["roster", "study", "task", "event_logs", "attempt_data"]
 CONTENT_DICT = {
     "roster": "roster-metadata.json",
     "study": "study-metadata.json",
-    "task": "task-metadata.json",
-    "event_logs": "event-logs.json",
-    "attempt_data": "attempt-data.json",
+    "task": "task-metadata.ndjson",
+    "event_logs": "event-logs.ndjson",
+    "attempt_data": "attempt-data.ndjson",
 }
 # Filename for the processed study metadata text file
 STUDY_METADATA_TXT = "study_info.txt"
@@ -94,16 +94,17 @@ def load_zip(zip_path):
 
 def load_df_from_file(
     file: TextIOBase | IO[bytes] | zipfile.ZipExtFile,
-    lines: bool = False,
+    lines: bool = True,
 ):
-    """Load dataframe from file
+    """Load dataframe from an NDJSON file object (directory or Zip member).
 
     Args:
         file (TextIOBase | zipfile.ZipExtFile): A readonly file object from directory or Zip
-        lines (bool, optional): Whether the file is in NDJSON format. Defaults to False.
+        lines (bool, optional): Whether the file is in NDJSON format. Defaults to True.
 
     Returns:
         pd.DataFrame: Loaded DataFrame.
+
     """
     df = pd.read_json(file, lines=lines, dtype_backend="pyarrow")
     return df
