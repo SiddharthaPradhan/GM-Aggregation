@@ -4,6 +4,9 @@ import pandas as pd
 import numpy as np
 import multiprocessing as mp
 import logging
+import gc
+import tempfile
+import os
 from tqdm import tqdm
 from .utils import (
     save_df,
@@ -30,6 +33,49 @@ class ProgressEvent(TypedDict, total=False):
 
 
 ProgressCallback = Callable[[ProgressEvent], None]
+
+
+def _stream_concat_csv_files(
+    file_paths: list[str],
+    dtype_map: dict | None = None,
+    chunk_size: int = 500000,
+    sort_by: list[str] | None = None,
+) -> pd.DataFrame:
+    """Read CSV files in chunks and concatenate without holding all data in memory.
+
+    Processes each file in chunks to minimize peak memory usage. If sort_by is provided,
+    uses in-place sorting to avoid creating temporary copies during sort operations.
+    """
+    all_chunks = []
+
+    for file_path in file_paths:
+        if os.path.getsize(file_path) == 0:
+            continue
+
+        for chunk in pd.read_csv(
+            file_path,
+            dtype=dtype_map,
+            chunksize=chunk_size,
+        ):
+            all_chunks.append(chunk)
+            if len(all_chunks) >= 2:
+                intermediate_df = pd.concat(all_chunks, ignore_index=True)
+                del all_chunks
+                all_chunks = [intermediate_df]
+                gc.collect()
+
+    if not all_chunks:
+        return pd.DataFrame()
+
+    result_df = pd.concat(all_chunks, ignore_index=True)
+
+    # Use in-place sort to avoid creating a copy—critical on memory-constrained systems
+    if sort_by:
+        result_df.sort_values(by=sort_by, inplace=True, ignore_index=True)
+
+    gc.collect()
+    return result_df
+
 
 ATTEMPT_TYPE_MAPPING = {
     "studentSessionId": "category",
@@ -159,15 +205,20 @@ def aggregate_and_save(
 
     save_df(attempt_level_df, "attempt_level", output_dir, output_type=output_type)
     save_df(student_problem_df, "student_problem", output_dir, output_type=output_type)
+    del attempt_level_df
+    gc.collect()
 
     student_df = _aggregate_to_student_level(student_problem_df)
     logger.debug("Finished Student Level Aggregation..")
+
     problem_df = _aggregate_to_problem_level(student_problem_df)
+    save_df(problem_df, "problem_level", output_dir, output_type=output_type)
+    del problem_df
+    gc.collect()
     logger.debug("Finished Problem Level Aggregation..")
     assignment_df = _aggregate_to_assignment_level(student_df)
 
     save_df(student_df, "student_level", output_dir, output_type=output_type)
-    save_df(problem_df, "problem_level", output_dir, output_type=output_type)
     write_to_study_meta_text(output_dir, assignment_df.to_string())
 
 
@@ -226,9 +277,16 @@ def aggregate_event_log(
 
     df_list_attempt = []
     df_list_student_problem = []
+    attempt_tmp_dir = None
+    student_problem_tmp_dir = None
 
     if dask_client is not None:
         from dask.distributed import as_completed as dask_as_completed
+
+        attempt_tmp_dir = tempfile.mkdtemp(prefix="agg-attempt-")
+        student_problem_tmp_dir = tempfile.mkdtemp(prefix="agg-student-problem-")
+        attempt_file_counter = [0]
+        student_problem_file_counter = [0]
 
         # Lazy submission: only keep a small window of serialised task DataFrames
         # in the scheduler at once so we never hold all N copies in memory.
@@ -265,8 +323,21 @@ def aggregate_event_log(
         ) as pbar:
             for n_done, future in enumerate(ac, start=1):
                 partial_attempt_level_df, partial_student_problem_df = future.result()
-                df_list_attempt.append(partial_attempt_level_df)
-                df_list_student_problem.append(partial_student_problem_df)
+                attempt_file_path = os.path.join(
+                    attempt_tmp_dir, f"attempt_{attempt_file_counter[0]}.csv"
+                )
+                student_problem_file_path = os.path.join(
+                    student_problem_tmp_dir,
+                    f"student_problem_{student_problem_file_counter[0]}.csv",
+                )
+                partial_attempt_level_df.to_csv(attempt_file_path, index=False)
+                partial_student_problem_df.to_csv(
+                    student_problem_file_path, index=False
+                )
+                attempt_file_counter[0] += 1
+                student_problem_file_counter[0] += 1
+                del partial_attempt_level_df, partial_student_problem_df
+                gc.collect()
                 pbar.update()
                 pbar.refresh()
                 if progress_callback is not None:
@@ -280,6 +351,14 @@ def aggregate_event_log(
                 next_f = _submit_next()
                 if next_f is not None:
                     ac.add(next_f)
+
+        # Consume any remaining futures and wait for all tasks to complete
+        remaining_futures = list(ac)
+        if remaining_futures:
+            dask_client.gather(remaining_futures)
+
+        # Wait for all workers to become idle before returning
+        dask_client.wait_for_workers(len(dask_client.nthreads()))
 
         if _is_split:
             event_log_df.cleanup()
@@ -319,24 +398,58 @@ def aggregate_event_log(
                             "total": total_tasks,
                         }
                     )
-    attempt_level_df = pd.concat(df_list_attempt, ignore_index=True)
-    student_problem_df = pd.concat(df_list_student_problem, ignore_index=True)
-    attempt_level_df = attempt_level_df.sort_values(
-        by=["studentSessionId", "taskNumber", "start_time"]
-    ).reset_index(drop=True)
-    student_problem_df = student_problem_df.sort_values(
-        by=["studentSessionId", "taskNumber"]
-    ).reset_index(drop=True)
-    if progress_callback is not None:
-        progress_callback(
-            {
-                "stage": "aggregation",
-                "completed": total_tasks,
-                "total": total_tasks,
-                "message": "Finished aggregation",
-            }
-        )
-    return attempt_level_df, student_problem_df
+
+    try:
+        if attempt_tmp_dir is not None and student_problem_tmp_dir is not None:
+            attempt_file_paths = sorted(
+                [
+                    os.path.join(attempt_tmp_dir, f)
+                    for f in os.listdir(attempt_tmp_dir)
+                    if f.endswith(".csv")
+                ]
+            )
+            student_problem_file_paths = sorted(
+                [
+                    os.path.join(student_problem_tmp_dir, f)
+                    for f in os.listdir(student_problem_tmp_dir)
+                    if f.endswith(".csv")
+                ]
+            )
+            attempt_level_df = _stream_concat_csv_files(
+                attempt_file_paths,
+                sort_by=["studentSessionId", "taskNumber", "start_time"],
+            )
+            student_problem_df = _stream_concat_csv_files(
+                student_problem_file_paths, sort_by=["studentSessionId", "taskNumber"]
+            )
+        else:
+            attempt_level_df = pd.concat(df_list_attempt, ignore_index=True)
+            student_problem_df = pd.concat(df_list_student_problem, ignore_index=True)
+            attempt_level_df.sort_values(
+                by=["studentSessionId", "taskNumber", "start_time"],
+                inplace=True,
+                ignore_index=True,
+            )
+            student_problem_df.sort_values(
+                by=["studentSessionId", "taskNumber"], inplace=True, ignore_index=True
+            )
+        if progress_callback is not None:
+            progress_callback(
+                {
+                    "stage": "aggregation",
+                    "completed": total_tasks,
+                    "total": total_tasks,
+                    "message": "Finished aggregation",
+                }
+            )
+        return attempt_level_df, student_problem_df
+    finally:
+        import shutil
+
+        if attempt_tmp_dir and os.path.exists(attempt_tmp_dir):
+            shutil.rmtree(attempt_tmp_dir, ignore_errors=True)
+        if student_problem_tmp_dir and os.path.exists(student_problem_tmp_dir):
+            shutil.rmtree(student_problem_tmp_dir, ignore_errors=True)
 
 
 def _aggregate_to_student_level(student_problem_df: pd.DataFrame) -> pd.DataFrame:

@@ -70,6 +70,8 @@ gm-aggregation --input /path/to/data --output-type csv
 -   `--njobs, -j`: Number of parallel jobs for aggregation (default: -1, uses all cores)
 -   `--overwrite, -w`: Overwrite existing output directory if it exists
 -   `--verbose, -v`: Enable verbose logging for debugging
+-   `--dask`: Enable Dask distributed processing for memory-constrained environments
+-   `--memory-limit`: Total Dask memory budget across all workers (e.g., `800MB`, `1GB`). Default: `6GB`. Excess is spilled to disk.
 
 ### Examples
 
@@ -82,7 +84,35 @@ python -m gm_aggregation -i /path/to/data/ -t sqlite -j 4 -v
 
 # Process with both CSV and SQLite output, overwrite existing files
 python -m gm_aggregation -i data.zip -t both -w
+
+# Process with Dask for memory-constrained environments (e.g., Heroku)
+python -m gm_aggregation -i data.zip -t csv --dask --memory-limit 800MB
+
+# Process with Dask and specific worker configuration
+python -m gm_aggregation -i data.zip -t csv --dask --memory-limit 1GB -j 2
 ```
+
+## Parallel Processing
+
+### Multiprocessing (Default)
+By default, the tool uses Python's multiprocessing module with the specified number of jobs (`-j`). This approach is suitable for most use cases and keeps memory usage predictable.
+
+### Dask Distributed Processing
+For memory-constrained environments (e.g., Heroku dynos), use the `--dask` flag:
+
+```bash
+python -m gm_aggregation -i data.zip -t csv --dask --memory-limit 800MB
+```
+
+**Key features:**
+- **Memory management**: Dask respects the memory limit and automatically spills excess to disk
+- **Streaming concatenation**: Results are written to disk incrementally, with chunked reading to prevent unbounded memory accumulation
+- **Spill-to-disk**: Temporary spill directory is used for overflow and cleaned up after processing
+
+**When to use:**
+- Processing on Heroku or other memory-constrained cloud platforms
+- Working with large datasets that approach available RAM
+- When `MemoryError` occurs with the default multiprocessing approach
 
 ## Input Data Structure
 

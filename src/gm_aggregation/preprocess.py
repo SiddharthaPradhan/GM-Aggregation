@@ -8,6 +8,8 @@ import os
 import pandas as pd
 import json
 import re
+import gc
+import tempfile
 from zipfile import ZipExtFile, ZipFile
 import logging
 import multiprocessing as mp
@@ -151,9 +153,13 @@ def handle_latex_in_event_log(
             }
         )
     df_list_event_log = []
+    tmp_dir = None
 
     if dask_client is not None:
         from dask.distributed import as_completed as dask_as_completed
+
+        tmp_dir = tempfile.mkdtemp(prefix="latex-event-log-")
+        file_counter = [0]
 
         n_concurrent = len(dask_client.nthreads()) * 2
         task_iter = iter(task_numbers)
@@ -183,7 +189,12 @@ def handle_latex_in_event_log(
             disable=None,
         ) as pbar:
             for completed, future in enumerate(ac, start=1):
-                df_list_event_log.append(future.result())
+                result_df = future.result()
+                file_path = os.path.join(tmp_dir, f"event_log_{file_counter[0]}.csv")
+                result_df.to_csv(file_path, index=False)
+                file_counter[0] += 1
+                del result_df
+                gc.collect()
                 pbar.update()
                 pbar.refresh()
                 if progress_callback is not None:
@@ -228,17 +239,50 @@ def handle_latex_in_event_log(
                         }
                     )
 
-    event_log_df: pd.DataFrame = pd.concat(df_list_event_log, ignore_index=True)
-    if progress_callback is not None:
-        progress_callback(
-            {
-                "stage": "event_log_preprocessing",
-                "completed": total_tasks,
-                "total": total_tasks,
-                "message": "Finished event log preprocessing",
-            }
-        )
-    return event_log_df
+    try:
+        if tmp_dir is not None:
+            file_paths = sorted(
+                [
+                    os.path.join(tmp_dir, f)
+                    for f in os.listdir(tmp_dir)
+                    if f.endswith(".csv")
+                ]
+            )
+
+            all_chunks = []
+            for file_path in file_paths:
+                df = pd.read_csv(file_path)
+                all_chunks.append(df)
+                if len(all_chunks) >= 4:
+                    intermediate_df = pd.concat(all_chunks, ignore_index=True)
+                    del all_chunks
+                    all_chunks = [intermediate_df]
+                    gc.collect()
+
+            event_log_df = (
+                pd.concat(all_chunks, ignore_index=True)
+                if all_chunks
+                else pd.DataFrame()
+            )
+            gc.collect()
+        else:
+            event_log_df = pd.concat(df_list_event_log, ignore_index=True)
+
+        if progress_callback is not None:
+            progress_callback(
+                {
+                    "stage": "event_log_preprocessing",
+                    "completed": total_tasks,
+                    "total": total_tasks,
+                    "message": "Finished event log preprocessing",
+                }
+            )
+        return event_log_df
+    finally:
+        if tmp_dir is not None:
+            import shutil
+
+            shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 def _discover_ndjson_columns(path: str) -> list[str]:
@@ -585,7 +629,7 @@ def preprocess_and_save_event_log(
             )
         return task_split
 
-    # Fallback: LaTeX conversion — use pandas
+    # Fallback: LaTeX conversion: use pandas
     event_log_df = load_df_from_file(get_file(input, "event_logs"), lines=True)
     event_log_df = preprocess_event_log(
         event_log_df,

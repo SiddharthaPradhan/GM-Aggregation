@@ -11,6 +11,8 @@ from .aggregate import aggregate_and_save
 from .preprocess import preprocess_and_save_event_log, preprocess_and_save_metadata
 from .utils import CONTENT_DICT, OUTPUT_TYPE, check_existence, get_study_id, load_zip
 
+logging.getLogger("distributed").setLevel(logging.ERROR)
+
 
 class ProgressEvent(TypedDict, total=False):
     stage: str
@@ -138,24 +140,23 @@ def run(
             from dask.utils import parse_bytes
 
             per_worker_bytes = parse_bytes(memory_limit) // n_workers
-            cluster = LocalCluster(
+            with LocalCluster(
                 n_workers=n_workers,
                 threads_per_worker=1,
                 memory_limit=per_worker_bytes,
                 local_directory=spill_dir,
-                silence_logs=logging.WARNING,
-            )
-            logger.info(
-                f"Dask cluster: {n_workers} worker(s), "
-                f"{memory_limit} total memory limit, spill → {spill_dir}"
-            )
-
-            with Client(cluster) as dask_client:
-                _run_stages(dask_client)
+                silence_logs=logging.ERROR,
+            ) as cluster:
+                logger.info(
+                    f"Dask cluster: {n_workers} worker(s), "
+                    f"{memory_limit} total memory limit, spill → {spill_dir}"
+                )
+                with Client(cluster) as dask_client:
+                    _run_stages(dask_client)
         finally:
             shutil.rmtree(spill_dir, ignore_errors=True)
     else:
-        logger.info("Dask disabled — using pandas/multiprocessing path")
+        logger.info("Dask is disabled using pandas/multiprocessing path")
         _run_stages(dask_client=None)
 
     logger.info(f"All processed files saved to {study_output_dir}")
