@@ -203,15 +203,31 @@ def aggregate_and_save(
     )
     logger.debug("Finished Attempt and Student-Problem Level Aggregation..")
 
+    # Sort attempt_level and student_problem before saving
+    attempt_level_df = attempt_level_df.astype(ATTEMPT_TYPE_MAPPING)
+    attempt_level_df.sort_values(
+        by=["studentSessionId", "taskNumber", "attemptHlc", "visitId"],
+        inplace=True,
+        ignore_index=True,
+    )
     save_df(attempt_level_df, "attempt_level", output_dir, output_type=output_type)
-    save_df(student_problem_df, "student_problem", output_dir, output_type=output_type)
     del attempt_level_df
     gc.collect()
 
+    student_problem_df = student_problem_df.astype(STUDENT_PROBLEM_TYPE_MAPPING)
+    student_problem_df.sort_values(
+        by=["studentSessionId", "taskNumber"],
+        inplace=True,
+        ignore_index=True,
+    )
+    save_df(student_problem_df, "student_problem", output_dir, output_type=output_type)
+
     student_df = _aggregate_to_student_level(student_problem_df)
+    student_df.sort_values(by="studentSessionId", inplace=True, ignore_index=True)
     logger.debug("Finished Student Level Aggregation..")
 
     problem_df = _aggregate_to_problem_level(student_problem_df)
+    problem_df.sort_values(by="taskNumber", inplace=True, ignore_index=True)
     save_df(problem_df, "problem_level", output_dir, output_type=output_type)
     del problem_df
     gc.collect()
