@@ -60,7 +60,7 @@ EVENT_LOG_TYPE_MAPPING = {
     "attemptHlc": "category",
     "actionId": "category",
     "steps": "uint16[pyarrow]",
-    "stars": "uint8[pyarrow]",
+    "stars": "int8[pyarrow]",
     "mistake": "category",
     "wasSolved": "bool[pyarrow]",
     "reason": "category",

@@ -7,7 +7,9 @@ import shutil
 import tempfile
 from typing import Callable, TypedDict
 
-from .aggregate import aggregate_and_save
+import pandas as pd
+
+from .aggregate import aggregate_event_log, finalize_and_save_aggregations
 from .preprocess import preprocess_and_save_event_log, preprocess_and_save_metadata
 from .utils import CONTENT_DICT, OUTPUT_TYPE, check_existence, get_study_id, load_zip
 
@@ -112,7 +114,10 @@ def run(
             }
         )
 
-    def _run_stages(dask_client) -> None:
+    def _run_dask_dependent_stages(
+        dask_client,
+        on_dask_tasks_done: Callable[[], None] | None = None,
+    ) -> tuple[pd.DataFrame, pd.DataFrame]:
         event_log_df = preprocess_and_save_event_log(
             input_file,
             str(study_output_dir),
@@ -122,15 +127,17 @@ def run(
             progress_callback=progress_callback,
             dask_client=dask_client,
         )
-        aggregate_and_save(
+        logger.info("Starting Aggregation..")
+        attempt_level_df, student_problem_df = aggregate_event_log(
             event_log_df,
             task_meta_df,
-            str(study_output_dir),
-            output_type,
             n_jobs=n_jobs,
             progress_callback=progress_callback,
             dask_client=dask_client,
+            on_dask_tasks_done=on_dask_tasks_done,
         )
+        logger.debug("Finished Attempt and Student-Problem Level Aggregation..")
+        return attempt_level_df, student_problem_df
 
     if use_dask:
         n_workers = max(1, n_jobs)
@@ -152,12 +159,29 @@ def run(
                     f"{memory_limit} total memory limit, spill → {spill_dir}"
                 )
                 with Client(cluster) as dask_client:
-                    _run_stages(dask_client)
+                    # Release the cluster as soon as the last Dask task finishes
+                    # rather than waiting for these `with` blocks to unwind, so the
+                    # scheduler/worker subprocess memory is freed before the
+                    # single-process CSV consolidation and final aggregation below
+                    # — both of which would otherwise sit in memory alongside it.
+                    def _release_cluster() -> None:
+                        dask_client.close()
+                        cluster.close()
+
+                    attempt_level_df, student_problem_df = _run_dask_dependent_stages(
+                        dask_client, on_dask_tasks_done=_release_cluster
+                    )
         finally:
             shutil.rmtree(spill_dir, ignore_errors=True)
     else:
         logger.info("Dask is disabled using pandas/multiprocessing path")
-        _run_stages(dask_client=None)
+        attempt_level_df, student_problem_df = _run_dask_dependent_stages(
+            dask_client=None
+        )
+
+    finalize_and_save_aggregations(
+        attempt_level_df, student_problem_df, str(study_output_dir), output_type
+    )
 
     logger.info(f"All processed files saved to {study_output_dir}")
     logger.info("Finished..")

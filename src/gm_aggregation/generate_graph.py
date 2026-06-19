@@ -214,8 +214,9 @@ def make_problem_graph(
                 global_G.nodes[node]["is_dead_end"] = True
                 dead_end_nodes.append(node)
         student_paths["dead_end_nodes"] = dead_end_nodes
+        global_graph_json = node_link_data(global_G, edges="links")
+        return global_graph_json, student_G_dict, student_paths
 
-    except nx.exception.NetworkXNoPath:
+    except nx.exception.NetworkXNoPath as e:
         logger.info(f"Problem {problem_id} has not been solved so far.")
-    global_graph_json = node_link_data(global_G, edges="links")
-    return global_graph_json, student_G_dict, student_paths
+        raise e

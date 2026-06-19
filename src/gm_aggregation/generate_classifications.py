@@ -109,8 +109,8 @@ def process_problem_classification(
         for key in problem_student_pathways.keys()
         if key not in ["start_state", "goal_state", "optimal_paths", "dead_end_nodes"]
     ]
-    global_dead_end_set = set(problem_student_pathways["dead_end_nodes"])
-    optimal_len = len(problem_student_pathways["optimal_paths"][0]) - 1
+    global_dead_end_set = set(problem_student_pathways.get("dead_end_nodes", []))
+    optimal_len = len(problem_student_pathways.get("optimal_paths", [[]])[0]) - 1
 
     df_list = []
     for stu_id in stu_id_list:

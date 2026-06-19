@@ -94,7 +94,7 @@ ATTEMPT_TYPE_MAPPING = {
     "num_keypad_errors": "uint16[pyarrow]",
     "num_shaking_errors": "uint16[pyarrow]",
     "num_snapping_errors": "uint16[pyarrow]",
-    "stars": "uint16[pyarrow]",
+    "stars": "int16[pyarrow]",
     "clicked_reset_button": "bool[pyarrow]",
     "clicked_retry_button": "bool[pyarrow]",
     "pause_time_ratio": "float[pyarrow]",
@@ -202,7 +202,24 @@ def aggregate_and_save(
         dask_client=dask_client,
     )
     logger.debug("Finished Attempt and Student-Problem Level Aggregation..")
+    finalize_and_save_aggregations(
+        attempt_level_df, student_problem_df, output_dir, output_type
+    )
 
+
+def finalize_and_save_aggregations(
+    attempt_level_df: pd.DataFrame,
+    student_problem_df: pd.DataFrame,
+    output_dir: str,
+    output_type: OUTPUT_TYPE,
+) -> None:
+    """Sort, save, and roll up attempt/student-problem level data to student, problem,
+    and assignment levels.
+
+    This is pure single-process pandas work with no Dask involvement. Callers that ran
+    aggregate_event_log on a Dask cluster should close/release that cluster before calling
+    this, since it would otherwise sit idle in memory for the whole duration of this call.
+    """
     # Sort attempt_level and student_problem before saving
     attempt_level_df = attempt_level_df.astype(ATTEMPT_TYPE_MAPPING)
     attempt_level_df.sort_values(
@@ -229,7 +246,8 @@ def aggregate_and_save(
     problem_df = _aggregate_to_problem_level(student_problem_df)
     problem_df.sort_values(by="taskNumber", inplace=True, ignore_index=True)
     save_df(problem_df, "problem_level", output_dir, output_type=output_type)
-    del problem_df
+    # student_problem_df has no remaining consumers past this point
+    del problem_df, student_problem_df
     gc.collect()
     logger.debug("Finished Problem Level Aggregation..")
     assignment_df = _aggregate_to_assignment_level(student_df)
@@ -260,6 +278,7 @@ def aggregate_event_log(
     n_jobs: int = -1,
     progress_callback: ProgressCallback | None = None,
     dask_client=None,
+    on_dask_tasks_done: Callable[[], None] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Aggregate event log data to attempt level and student-problem level.
 
@@ -267,6 +286,10 @@ def aggregate_event_log(
         event_log_df (pd.DataFrame): DataFrame containing preprocessed event log data.
         task_metadata_df (pd.DataFrame): DataFrame containing task metadata.
         n_jobs (int, optional): Number of parallel jobs to use. Defaults to -1 (use all available cores).
+        on_dask_tasks_done (Callable[[], None], optional): Called right after all Dask
+            tasks finish (before the single-process CSV consolidation below) so a caller
+            that owns the Dask cluster can release it instead of holding it idle for the
+            rest of this call.
     Returns:
         tuple[pd.DataFrame, pd.DataFrame]: DataFrames aggregated to attempt level and student-problem level.
     """
@@ -378,6 +401,9 @@ def aggregate_event_log(
 
         if _is_split:
             event_log_df.cleanup()
+
+        if on_dask_tasks_done is not None:
+            on_dask_tasks_done()
     else:
         mp_jobs = []
         for task_number in task_numbers:
